@@ -6,6 +6,9 @@ jobs:
     runs-on: [ubuntu-latest]
     container: nvidia/cuda:12.6.3-devel-ubuntu20.04
     steps:
+    - name: install opencl
+      run: |
+        apt install ocl-icd-opencl-dev
     - uses: actions/checkout@v4
     - name: build
       run: |
