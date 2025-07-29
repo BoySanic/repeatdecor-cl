@@ -1,0 +1,16 @@
+on: [push]
+
+jobs:
+  all_cross:
+    name: cuda/release/linux
+    runs-on: [ubuntu-latest]
+    container: nvidia/cuda:12.6.3-devel-ubuntu20.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: build
+      run: |
+        make
+    - uses: actions/upload-artifact@v4
+      with:
+       name: ${{ github.event.repository.name }}.${{ github.ref_name }}.${{ github.run_id }}.all
+       path: ./repeatdecor-cl*
