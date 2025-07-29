@@ -8,6 +8,7 @@ jobs:
     steps:
     - name: install opencl
       run: |
+        apt update
         apt install ocl-icd-opencl-dev
     - uses: actions/checkout@v4
     - name: build
