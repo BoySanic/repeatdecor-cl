@@ -9,7 +9,7 @@ jobs:
     - name: install opencl
       run: |
         apt update
-        apt install ocl-icd-opencl-dev mingw-w64 -y
+        apt install ocl-icd-opencl-dev mingw-w64 libpthread -y
     - uses: actions/checkout@v4
     - name: build
       run: |
