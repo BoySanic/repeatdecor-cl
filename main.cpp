@@ -6,7 +6,6 @@
 #include <stdint.h>
 #include <chrono>
 
-#define min(a, b) ((a) < (b) ? (a) : (b))
 #define RESULTS_BUFFER_SIZE 1024
 #define HASH_BATCH_SIZE 4
 // In your host code, replace the #defines with:
@@ -15,18 +14,26 @@
 #define BATCH_SIZE (BLOCK_SIZE * THREAD_SIZE)
 #define SCORE_CUTOFF 50
 
+#ifdef BOINC
+    constexpr int RUNS_PER_CHECKPOINT = 16;
+    #include "boinc/boinc_api.h"
+    #if defined _WIN32 || defined _WIN64
+        #include "boinc/boinc_win.h"
+    #endif
+#endif
+
 typedef struct {
     int64_t  score;
     uint64_t seed;
     int64_t  a, b;
 } Result;
 
-typedef struct {
-    size_t work_size;
-    double items_per_second;
-    double time_ms;
-    bool valid;
-} BenchmarkResult;
+struct checkpoint_vars {
+    uint64_t range_min;
+    uint64_t range_max;
+    uint32_t stored_checksum;
+    uint64_t elapsed_chkpoint;
+};
 
 const char* get_cl_error_string(cl_int error) {
     switch(error) {
@@ -126,82 +133,6 @@ void print_device_info(cl_device_id device, int device_index) {
     printf("\n");
 }
 
-size_t benchmark_work_sizes(cl_context context, cl_device_id device, 
-                                       cl_command_queue queue, cl_kernel kernel,
-                                       cl_mem results_buf, cl_mem result_idx_buf, 
-                                       cl_mem checksum_buf) {
-    printf("Testing conservative work sizes...\n");
-    
-    // Get device info
-    cl_uint compute_units;
-    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cl_uint), &compute_units, NULL);
-    
-    // Test only reasonable sizes based on compute units
-    size_t test_sizes[] = {
-        compute_units * 64,
-        compute_units * 128,
-        compute_units * 256,
-        compute_units * 512,
-        compute_units * 1024,
-        BATCH_SIZE / 4,
-        BATCH_SIZE / 2,
-        BATCH_SIZE,
-        BATCH_SIZE * 2  // Don't go beyond 2x original
-    };
-    
-    size_t num_tests = sizeof(test_sizes) / sizeof(test_sizes[0]);
-    size_t best_size = BATCH_SIZE;
-    double best_throughput = 0.0;
-    
-    const uint64_t test_seed = 12345;
-    
-    for (size_t i = 0; i < num_tests; i++) {
-        size_t work_size = test_sizes[i];
-        if (work_size > BATCH_SIZE * 2) continue; // Safety limit
-        
-        printf("Testing work size: %zu... ", work_size);
-        
-        // Reset buffers
-        int zero_count = 0;
-        uint32_t zero_checksum = 0;
-        clEnqueueWriteBuffer(queue, result_idx_buf, CL_TRUE, 0, sizeof(int), &zero_count, 0, NULL, NULL);
-        clEnqueueWriteBuffer(queue, checksum_buf, CL_TRUE, 0, sizeof(uint32_t), &zero_checksum, 0, NULL, NULL);
-        
-        // Set kernel args
-        clSetKernelArg(kernel, 0, sizeof(uint64_t), &test_seed);
-        clSetKernelArg(kernel, 1, sizeof(cl_mem), &results_buf);
-        clSetKernelArg(kernel, 2, sizeof(cl_mem), &result_idx_buf);
-        clSetKernelArg(kernel, 3, sizeof(cl_mem), &checksum_buf);
-        
-        // Benchmark
-        auto start_time = std::chrono::high_resolution_clock::now();
-        
-        cl_int err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &work_size, NULL, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            printf("FAILED\n");
-            continue;
-        }
-        
-        clFinish(queue);
-        
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        
-        double time_ms = duration.count() / 1000.0;
-        double items_per_second = (work_size * 4.0 / time_ms) * 1000.0;
-        
-        printf("%.2f ms, %.0f items/sec\n", time_ms, items_per_second);
-        
-        if (items_per_second > best_throughput) {
-            best_throughput = items_per_second;
-            best_size = work_size;
-        }
-    }
-    
-    printf("Selected work size: %zu (%.0f items/sec)\n", best_size, best_throughput);
-    return best_size;
-}
-
 char* load_kernel_source(const char* filename, size_t* length_out) {
     FILE* f = fopen(filename, "rb");
     if (!f) return NULL;
@@ -215,6 +146,105 @@ char* load_kernel_source(const char* filename, size_t* length_out) {
     fclose(f);
     if (length_out) *length_out = len;
     return src;
+}
+
+size_t calculate_optimal_local_work_size(cl_device_id device) {
+    cl_device_type device_type;
+    cl_uint compute_units;
+    size_t max_work_group_size;
+    cl_ulong global_mem_size;
+    char device_name[256];
+    char vendor_name[256];
+    
+    clGetDeviceInfo(device, CL_DEVICE_TYPE, sizeof(device_type), &device_type, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_work_group_size), &max_work_group_size, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem_size), &global_mem_size, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
+    clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(vendor_name), vendor_name, NULL);
+    
+    size_t suggested_size = 256; // More aggressive default
+    
+    // GPU-specific optimizations
+    if (device_type & CL_DEVICE_TYPE_GPU) {
+        // NVIDIA GPUs - be much more aggressive
+        if (strstr(vendor_name, "NVIDIA") != NULL) {
+            if (strstr(device_name, "RTX 40") != NULL) {
+                // RTX 4090, 4080, etc.
+                suggested_size = max_work_group_size; // Use maximum!
+            } else if (strstr(device_name, "RTX 30") != NULL) {
+                // RTX 3090, 3080, 3070, etc.
+                suggested_size = max_work_group_size; // Use maximum!
+            } else if (strstr(device_name, "RTX 20") != NULL || strstr(device_name, "GTX 16") != NULL) {
+                // RTX 2080, GTX 1660, etc.
+                suggested_size = max_work_group_size / 2;
+            } else if (strstr(device_name, "GTX") != NULL || strstr(device_name, "RTX") != NULL) {
+                // Other RTX/GTX cards
+                suggested_size = max_work_group_size / 4;
+            } else {
+                // Older NVIDIA cards
+                suggested_size = 512;
+            }
+        }
+        // AMD GPUs - more aggressive
+        else if (strstr(vendor_name, "AMD") != NULL || strstr(vendor_name, "Advanced Micro Devices") != NULL) {
+            if (strstr(device_name, "RX 7") != NULL || strstr(device_name, "RX 6") != NULL) {
+                // RDNA2/RDNA3 cards
+                suggested_size = max_work_group_size;
+            } else if (strstr(device_name, "RX 5") != NULL || strstr(device_name, "Vega") != NULL) {
+                // RDNA1/Vega cards - but be careful with integrated Vega
+                if (global_mem_size > 4ULL * 1024 * 1024 * 1024) { // Discrete GPU
+                    suggested_size = max_work_group_size;
+                } else { // Integrated GPU
+                    suggested_size = max_work_group_size / 2;
+                }
+            } else if (strstr(device_name, "RX") != NULL) {
+                // Other RX cards
+                suggested_size = max_work_group_size / 2;
+            } else {
+                // Integrated or older AMD
+                suggested_size = 256;
+            }
+        }
+        // Intel GPUs
+        else if (strstr(vendor_name, "Intel") != NULL) {
+            if (strstr(device_name, "Arc") != NULL) {
+                // Intel Arc discrete GPUs
+                suggested_size = max_work_group_size / 2;
+            } else {
+                // Intel integrated GPUs
+                suggested_size = 256;
+            }
+        }
+        
+        // High compute unit count = use more threads
+        if (compute_units >= 80) {
+            // Don't reduce, keep at max
+        } else if (compute_units >= 40) {
+            // Keep high
+        } else if (compute_units <= 8) {
+            // Only reduce for very low-end GPUs
+            suggested_size = (suggested_size > 512) ? 512 : suggested_size;
+        }
+    }
+    // CPU devices
+    else if (device_type & CL_DEVICE_TYPE_CPU) {
+        suggested_size = compute_units * 4; // More aggressive for CPUs too
+    }
+    
+    // Ensure it's within device limits
+    suggested_size = (suggested_size > max_work_group_size) ? max_work_group_size : suggested_size;
+    
+    // Don't force power of 2 - many modern GPUs don't require it
+    // Just ensure it's reasonable
+    if (suggested_size < 64) suggested_size = 64;
+    
+    printf("Device: %s (%s)\n", device_name, vendor_name);
+    printf("Compute Units: %u, Max Work Group: %zu\n", compute_units, max_work_group_size);
+    printf("Selected local work size: %zu (%.1f%% of max)\n", 
+           suggested_size, (double)suggested_size / max_work_group_size * 100.0);
+    
+    return suggested_size;
 }
 
 int main(int argc, char **argv) {
@@ -241,7 +271,54 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+    #ifdef BOINC
+        BOINC_OPTIONS options;
+        boinc_options_defaults(options);
+        options.normal_thread_priority = true;
+        boinc_init_options(&options);
+        APP_INIT_DATA aid;
+        boinc_get_init_data(aid);
+        if (aid.gpu_device_num >= 0) {
+            //If BOINC client provided us a device ID
+            device_id = aid.gpu_device_num;
+            fprintf(stderr, "boinc gpu %i gpuindex: %i \n", aid.gpu_device_num, device_id);
+        }
+        else {
+            //If BOINC client did not provide us a device ID
+            device_id = -5;
+            for (int i = 1; i < argc; i += 2) {
+                //Check for a --device flag, just in case we missed it earlier, use it if it's available. For older clients primarily.
+                if (strcmp(argv[i], "-d") == 0) {
+                    sscanf(argv[i + 1], "%i", &device_id);
+                }
 
+            }
+            if (device_id == -5) {
+                //Something has gone wrong. It pulled from BOINC, got -1. No --device parameter present.
+                fprintf(stderr, "Error: No --device parameter provided! Defaulting to device 0...\n");
+                device_id = 0;
+            }
+            fprintf(stderr, "stndalone gpuindex %i (aid value: %i)\n", device_id, aid.gpu_device_num);
+        }
+        FILE* checkpoint_data = boinc_fopen("checkpoint.txt", "rb");
+        if (!checkpoint_data) {
+            //No checkpoint file was found. Proceed from the beginning.
+            fprintf(stderr, "No checkpoint to load\n");
+        }
+        else {
+            //Load from checkpoint. You can put any data in data_store that you need to keep between runs of this program.
+            boinc_begin_critical_section();
+            struct checkpoint_vars data_store;
+            fread(&data_store, sizeof(data_store), 1, checkpoint_data);
+            start_seed = data_store.range_min;
+            end_seed = data_store.range_max;
+            time_elapsed = data_store.elapsed_chkpoint;
+            checksum = data_store.stored_checksum;
+            fprintf(stderr, "Checkpoint loaded, task time %llu us, seed pos: %llu, checksum val: %llu\n", time_elapsed, start_seed, checksum);
+            fclose(checkpoint_data);
+            boinc_end_critical_section();
+        }
+    #endif // BOINC
     // Enhanced OpenCL setup with verbose logging
     cl_int err;
     cl_uint num_platforms;
@@ -400,16 +477,18 @@ int main(int argc, char **argv) {
 
     auto main_start_time = std::chrono::high_resolution_clock::now();
     auto last_update_time = main_start_time;
-    // Calculate optimal work sizes (add this before the main loop)
+
 
     clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_work_group_size), &max_work_group_size, NULL);
 
-    size_t local_work_size = min(256, max_work_group_size);
-    size_t work_chunk_size = local_work_size * 1024; // e.g., 256K work items per chunk
+    cl_uint compute_units;
+    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
+    size_t local_work_size = calculate_optimal_local_work_size(device);
+    size_t work_chunk_size = local_work_size * (compute_units * 4); // Scale chunk size too
 
     printf("Using local_work_size: %zu, work_chunk_size: %zu\n", local_work_size, work_chunk_size);
     printf("Will launch %zu kernel chunks per iteration\n", (BATCH_SIZE + work_chunk_size - 1) / work_chunk_size);
-
+    int checkpointTemp = 0;
     // Modified main processing loop
     for (uint64_t curr_seed = start_seed; curr_seed <= end_seed; curr_seed += BATCH_SIZE) {
         // Reset results count once per batch
@@ -487,7 +566,32 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Error reading results count: %s\n", get_cl_error_string(err));
             break;
         }
-        
+        #ifdef BOINC
+            if (completed_iterations % RUNS_PER_CHECKPOINT == 0 || boinc_time_to_checkpoint()) {
+                auto checkpoint_time = std::chrono::high_resolution_clock::now();
+                time_elapsed = duration_cast<milliseconds>(checkpoint_time - start_time).count() + time_elapsed;
+                //Checkpointing for BOINC
+                boinc_begin_critical_section(); // Boinc should not interrupt this
+
+                checkpointTemp = 0;
+                boinc_delete_file("checkpoint.txt"); // Don't touch, same func as normal fdel
+                FILE* checkpoint_data = boinc_fopen("checkpoint.txt", "wb");
+
+                struct checkpoint_vars data_store;
+                data_store.range_min = curr_seed + BATCH_SIZE; // this seed was already completed, processing can resume from next seed
+                data_store.range_max = end_seed;
+                data_store.elapsed_chkpoint = time_elapsed;
+                data_store.stored_checksum = checksum;
+                fwrite(&data_store, sizeof(data_store), 1, checkpoint_data);
+                fclose(checkpoint_data);
+
+                boinc_end_critical_section();
+                boinc_checkpoint_completed(); // Checkpointing completed
+            }
+            // Update boinc client with percentage
+            double frac = (double)(curr_seed - start_seed + 1) / (double)(end_seed - start_seed);
+            boinc_fraction_done(frac);
+        #endif // BOINC
         if (results_count > 0) {
             if (results_count > RESULTS_BUFFER_SIZE) {
                 fprintf(stderr, "Warning: Results count (%d) exceeds buffer size (%d), clamping\n", 
@@ -575,6 +679,8 @@ int main(int argc, char **argv) {
     fclose(seed_output);
     free(kernelSource);
     printf("Cleanup completed\n");
-
+    #ifdef BOINC
+        boinc_finish(0);
+    #endif
     return 0;
 }

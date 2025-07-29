@@ -8,43 +8,59 @@ CROSS_CXX = $(MINGW_PREFIX)-g++
 CROSS_CXXFLAGS = -std=c++11 -O3 -Wall -static-libgcc -static-libstdc++ 
 
 # Paths for Windows dependencies
-WIN_DEPS_DIR = ./windows-deps
-WIN_INCLUDE_DIR = $(WIN_DEPS_DIR)/include
-WIN_LIB_DIR = $(WIN_DEPS_DIR)/lib
+WIN_LIBS_DIR = ./lib/opencl/win
 
 # OpenCL library paths
 OPENCL_LIBS = -lOpenCL
-WIN_OPENCL_LIBS = -L$(WIN_LIB_DIR) -lOpenCL
+WIN_OPENCL_LIBS = -L$(WIN_LIBS_DIR) -lOpenCL
+
+# BOINC library paths
+BOINC_LIBS = ./lib/boinc/
+BOINC_WIN = ./lib/boinc/win
+BOINC_LIN = ./lib/boinc/lin
+
+INCLUDE_DIR = ./include
+BOINC_INCLUDE = $(INCLUDE_DIR)/boinc
+BOINC_INCLUDE_WIN = $(INCLUDE_DIR)/boinc/win
 
 # For macOS
 ifeq ($(shell uname), Darwin)
     OPENCL_LIBS = -framework OpenCL
 endif
 
-# BOINC support (uncomment if needed)
-# CXXFLAGS += -DBOINC
-# CROSS_CXXFLAGS += -DBOINC
-# BOINC_LIBS = -lboinc_api -lboinc
-# WIN_BOINC_LIBS = -L$(WIN_LIB_DIR) -lboinc_api -lboinc
 
-TARGET = seed_search
-WIN_TARGET = seed_search.exe
+LIN_TARGET = repeatdecor-cl
+LIN_BOINC_TARGET = repeatdecor-cl_boinc
+WIN_TARGET = repeatdecor-cl.exe
+WIN_BOINC_TARGET = repeatdecor-cl_boinc.exe
 SOURCES = main.cpp
 
-.PHONY: all clean windows native
+.PHONY: all clean windows native boinc linux boinc_win boinc_lin
 
-all: native
+all: linux windows boinc_win boinc_lin
+boinc: boinc_win boinc_lin
+windows: boinc_win windows
+native: boinc_lin linux
 
-native: $(TARGET)
+linux: $(LIN_TARGET)
 
 windows: $(WIN_TARGET)
 
-$(TARGET): $(SOURCES)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCES) $(OPENCL_LIBS) $(BOINC_LIBS)
+boinc_win: $(WIN_BOINC_TARGET)
+
+boinc_lin: $(LIN_BOINC_TARGET)
+
+$(LIN_TARGET): $(SOURCES)
+	$(CXX) $(CXXFLAGS) -o $(LIN_TARGET) $(SOURCES) $(OPENCL_LIBS)
 
 $(WIN_TARGET): $(SOURCES)
-	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(WIN_INCLUDE_DIR) -o $(WIN_TARGET) $(SOURCES) $(WIN_OPENCL_LIBS) $(WIN_BOINC_LIBS)
+	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -o $(WIN_TARGET) $(SOURCES) $(WIN_OPENCL_LIBS)
 
+$(WIN_BOINC_TARGET): $(SOURCES)
+	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -I$(BOINC_INCLUDE_WIN) -L$(BOINC_WIN) -o $(WIN_BOINC_TARGET) $(SOURCES) $(WIN_OPENCL_LIBS) -D_WIN32 -DBOINC -lboinc_api -lboinc -luser32
+
+$(LIN_BOINC_TARGET): $(SOURCES)
+	$(CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -L$(BOINC_LIN) -o $(LIN_BOINC_TARGET) $(SOURCES) $(OPENCL_LIBS) -DBOINC -lboinc_api -lboinc
 
 clean:
-	rm -f $(TARGET) $(WIN_TARGET)
+	rm -f $(LIN_TARGET) $(WIN_TARGET) $(WIN_BOINC_TARGET) $(LIN_BOINC_TARGET)
