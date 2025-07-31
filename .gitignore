@@ -1,0 +1,5 @@
+boinc_lockfile
+repeatdecor-cl*
+*.exe
+seeds.txt
+stderr.txt

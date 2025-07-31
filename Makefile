@@ -38,9 +38,8 @@ SOURCES = main.cpp
 .PHONY: all clean windows native boinc linux boinc_win boinc_lin
 
 all: linux windows boinc_win boinc_lin
-boinc: boinc_win boinc_lin
-windows: boinc_win windows
-native: boinc_lin linux
+windows: $(WIN_TARGET) $(WIN_BOINC_TARGET)
+native: $(LIN_TARGET) $(LIN_BOINC_TARGET)
 
 linux: $(LIN_TARGET)
 
@@ -57,10 +56,10 @@ $(WIN_TARGET): $(SOURCES)
 	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -o $(WIN_TARGET) $(SOURCES) $(WIN_OPENCL_LIBS)
 
 $(WIN_BOINC_TARGET): $(SOURCES)
-	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -I$(BOINC_INCLUDE_WIN) -L$(BOINC_WIN) -o $(WIN_BOINC_TARGET) $(SOURCES) $(WIN_OPENCL_LIBS) -D_WIN32 -DBOINC -lboinc_api -lboinc -luser32 -lpthread
+	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -I$(BOINC_INCLUDE_WIN) -L$(BOINC_WIN) -o $(WIN_BOINC_TARGET) $(SOURCES) -D_WIN32 -DBOINC -lboinc_api -lboinc_opencl -lboinc -luser32 -lpthread $(WIN_OPENCL_LIBS)
 
 $(LIN_BOINC_TARGET): $(SOURCES)
-	$(CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -L$(BOINC_LIN) -o $(LIN_BOINC_TARGET) $(SOURCES) $(OPENCL_LIBS) -DBOINC -lboinc_api -lboinc -lpthread
+	$(CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -L$(BOINC_LIN) -o $(LIN_BOINC_TARGET) $(SOURCES) -DBOINC -lboinc_api -lboinc -lpthread -lboinc_opencl $(OPENCL_LIBS) 
 
 clean:
 	rm -f $(LIN_TARGET) $(WIN_TARGET) $(WIN_BOINC_TARGET) $(LIN_BOINC_TARGET)

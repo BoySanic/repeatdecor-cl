@@ -5,17 +5,18 @@
 #include <string.h>
 #include <stdint.h>
 #include <chrono>
+#include <string>
 
 #define RESULTS_BUFFER_SIZE 1024
-#define HASH_BATCH_SIZE 4
-// In your host code, replace the #defines with:
-#define THREAD_SIZE 512
+#define HASH_BATCH_SIZE 2
+#define THREAD_SIZE 256
 #define BLOCK_SIZE (1ULL << 23)  // 8,388,608 - same as CUDA
 #define BATCH_SIZE (BLOCK_SIZE * THREAD_SIZE)
 #define SCORE_CUTOFF 50
 
 #ifdef BOINC
     constexpr int RUNS_PER_CHECKPOINT = 16;
+    #include "boinc/boinc_opencl.h"
     #include "boinc/boinc_api.h"
     #if defined _WIN32 || defined _WIN64
         #include "boinc/boinc_win.h"
@@ -148,112 +149,15 @@ char* load_kernel_source(const char* filename, size_t* length_out) {
     return src;
 }
 
-size_t calculate_optimal_local_work_size(cl_device_id device) {
-    cl_device_type device_type;
-    cl_uint compute_units;
-    size_t max_work_group_size;
-    cl_ulong global_mem_size;
-    char device_name[256];
-    char vendor_name[256];
-    
-    clGetDeviceInfo(device, CL_DEVICE_TYPE, sizeof(device_type), &device_type, NULL);
-    clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
-    clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_work_group_size), &max_work_group_size, NULL);
-    clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_mem_size), &global_mem_size, NULL);
-    clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
-    clGetDeviceInfo(device, CL_DEVICE_VENDOR, sizeof(vendor_name), vendor_name, NULL);
-    
-    size_t suggested_size = 256; // More aggressive default
-    
-    // GPU-specific optimizations
-    if (device_type & CL_DEVICE_TYPE_GPU) {
-        // NVIDIA GPUs - be much more aggressive
-        if (strstr(vendor_name, "NVIDIA") != NULL) {
-            if (strstr(device_name, "RTX 40") != NULL) {
-                // RTX 4090, 4080, etc.
-                suggested_size = max_work_group_size; // Use maximum!
-            } else if (strstr(device_name, "RTX 30") != NULL) {
-                // RTX 3090, 3080, 3070, etc.
-                suggested_size = max_work_group_size; // Use maximum!
-            } else if (strstr(device_name, "RTX 20") != NULL || strstr(device_name, "GTX 16") != NULL) {
-                // RTX 2080, GTX 1660, etc.
-                suggested_size = max_work_group_size / 2;
-            } else if (strstr(device_name, "GTX") != NULL || strstr(device_name, "RTX") != NULL) {
-                // Other RTX/GTX cards
-                suggested_size = max_work_group_size / 4;
-            } else {
-                // Older NVIDIA cards
-                suggested_size = 512;
-            }
-        }
-        // AMD GPUs - more aggressive
-        else if (strstr(vendor_name, "AMD") != NULL || strstr(vendor_name, "Advanced Micro Devices") != NULL) {
-            if (strstr(device_name, "RX 7") != NULL || strstr(device_name, "RX 6") != NULL) {
-                // RDNA2/RDNA3 cards
-                suggested_size = max_work_group_size;
-            } else if (strstr(device_name, "RX 5") != NULL || strstr(device_name, "Vega") != NULL) {
-                // RDNA1/Vega cards - but be careful with integrated Vega
-                if (global_mem_size > 4ULL * 1024 * 1024 * 1024) { // Discrete GPU
-                    suggested_size = max_work_group_size;
-                } else { // Integrated GPU
-                    suggested_size = max_work_group_size / 2;
-                }
-            } else if (strstr(device_name, "RX") != NULL) {
-                // Other RX cards
-                suggested_size = max_work_group_size / 2;
-            } else {
-                // Integrated or older AMD
-                suggested_size = 256;
-            }
-        }
-        // Intel GPUs
-        else if (strstr(vendor_name, "Intel") != NULL) {
-            if (strstr(device_name, "Arc") != NULL) {
-                // Intel Arc discrete GPUs
-                suggested_size = max_work_group_size / 2;
-            } else {
-                // Intel integrated GPUs
-                suggested_size = 256;
-            }
-        }
-        
-        // High compute unit count = use more threads
-        if (compute_units >= 80) {
-            // Don't reduce, keep at max
-        } else if (compute_units >= 40) {
-            // Keep high
-        } else if (compute_units <= 8) {
-            // Only reduce for very low-end GPUs
-            suggested_size = (suggested_size > 512) ? 512 : suggested_size;
-        }
-    }
-    // CPU devices
-    else if (device_type & CL_DEVICE_TYPE_CPU) {
-        suggested_size = compute_units * 4; // More aggressive for CPUs too
-    }
-    
-    // Ensure it's within device limits
-    suggested_size = (suggested_size > max_work_group_size) ? max_work_group_size : suggested_size;
-    
-    // Don't force power of 2 - many modern GPUs don't require it
-    // Just ensure it's reasonable
-    if (suggested_size < 64) suggested_size = 64;
-    
-    printf("Device: %s (%s)\n", device_name, vendor_name);
-    printf("Compute Units: %u, Max Work Group: %zu\n", compute_units, max_work_group_size);
-    printf("Selected local work size: %zu (%.1f%% of max)\n", 
-           suggested_size, (double)suggested_size / max_work_group_size * 100.0);
-    
-    return suggested_size;
-}
-
 int main(int argc, char **argv) {
     using namespace std::chrono;
     auto start_time = high_resolution_clock::now();
     uint64_t time_elapsed = 0;
     uint64_t start_seed = 0;
     uint64_t end_seed   = 211414360895ULL / HASH_BATCH_SIZE;
-    uint64_t device_id  = 0;
+    int device_arg  = 0;
+    cl_device_id device = 0;
+    cl_platform_id platform = 0;
     uint32_t checksum = 0;
     FILE* seed_output = fopen("seeds.txt", "w");
     if (!seed_output) { fprintf(stderr, "Failed to open seeds.txt\n"); return 1; }
@@ -265,40 +169,26 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-e") && i + 1 < argc)
             end_seed = strtoull(argv[++i], nullptr, 0);
         else if (!strcmp(argv[i], "-d") && i + 1 < argc)
-            device_id = strtoull(argv[++i], nullptr, 0);
+            device_arg = std::stoi(argv[++i], nullptr, 0);
         else {
             printf("Usage: %s [-s start_seed] [-e end_seed] [-d device_id]\n", argv[0]);
             return 0;
         }
     }
+    cl_int err;
     #ifdef BOINC
         BOINC_OPTIONS options;
         boinc_options_defaults(options);
         options.normal_thread_priority = true;
         boinc_init_options(&options);
         APP_INIT_DATA aid;
-        boinc_get_init_data(aid);
-        if (aid.gpu_device_num >= 0) {
-            //If BOINC client provided us a device ID
-            device_id = aid.gpu_device_num;
-            fprintf(stderr, "boinc gpu %i gpuindex: %i \n", aid.gpu_device_num, device_id);
+        err = boinc_get_opencl_ids(&device, &platform);
+        if(CL_SUCCESS != err) {
+            fprintf(stderr, "Error occurred obtaining opencl_ids from boinc: %s\n", get_cl_error_string(err));
         }
-        else {
-            //If BOINC client did not provide us a device ID
-            device_id = -5;
-            for (int i = 1; i < argc; i += 2) {
-                //Check for a --device flag, just in case we missed it earlier, use it if it's available. For older clients primarily.
-                if (strcmp(argv[i], "-d") == 0) {
-                    sscanf(argv[i + 1], "%i", &device_id);
-                }
-
-            }
-            if (device_id == -5) {
-                //Something has gone wrong. It pulled from BOINC, got -1. No --device parameter present.
-                fprintf(stderr, "Error: No --device parameter provided! Defaulting to device 0...\n");
-                device_id = 0;
-            }
-            fprintf(stderr, "stndalone gpuindex %i (aid value: %i)\n", device_id, aid.gpu_device_num);
+        if (device != nullptr && platform != nullptr) {
+            //If BOINC client provided us a device ID
+            fprintf(stderr, "boinc gpu %i platform: %i \n", device, platform);
         }
         FILE* checkpoint_data = boinc_fopen("checkpoint.txt", "rb");
         if (!checkpoint_data) {
@@ -318,65 +208,66 @@ int main(int argc, char **argv) {
             fclose(checkpoint_data);
             boinc_end_critical_section();
         }
+    #else
+        cl_uint num_platforms;
+        cl_platform_id platforms[10];
+        
+        printf("=== OpenCL Platform Detection ===\n");
+        err = clGetPlatformIDs(10, platforms, &num_platforms);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error getting platform IDs: %s\n", get_cl_error_string(err));
+            return 1;
+        }
+        printf("Found %u OpenCL platform(s)\n\n", num_platforms);
+        
+        // Print platform information
+        for (cl_uint i = 0; i < num_platforms; i++) {
+            char platform_name[256];
+            char platform_vendor[256];
+            char platform_version[256];
+            
+            clGetPlatformInfo(platforms[i], CL_PLATFORM_NAME, sizeof(platform_name), platform_name, NULL);
+            clGetPlatformInfo(platforms[i], CL_PLATFORM_VENDOR, sizeof(platform_vendor), platform_vendor, NULL);
+            clGetPlatformInfo(platforms[i], CL_PLATFORM_VERSION, sizeof(platform_version), platform_version, NULL);
+            
+            printf("Platform %u:\n", i);
+            printf("  Name: %s\n", platform_name);
+            printf("  Vendor: %s\n", platform_vendor);
+            printf("  Version: %s\n", platform_version);
+            printf("\n");
+        }
+        
+        // Use first platform
+        platform = platforms[0];
+        printf("Using platform 0\n\n");
+        
+        printf("=== OpenCL Device Detection ===\n");
+        cl_uint num_devices;
+        cl_device_id devices[10];
+        
+        err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 10, devices, &num_devices);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error getting device IDs: %s\n", get_cl_error_string(err));
+            return 1;
+        }
+        printf("Found %u device(s)\n\n", num_devices);
+        
+        // Print all device information
+        for (cl_uint i = 0; i < num_devices; i++) {
+            print_device_info(devices[i], i);
+        }
+        
+        // Select device
+        if (device_arg >= num_devices) {
+            fprintf(stderr, "Error: Device ID %lu not found. Available devices: 0-%u\n", device_arg, num_devices - 1);
+            return 1;
+        }
+        
+        device = devices[device_arg];
     #endif // BOINC
     // Enhanced OpenCL setup with verbose logging
-    cl_int err;
-    cl_uint num_platforms;
-    cl_platform_id platforms[10];
-    
-    printf("=== OpenCL Platform Detection ===\n");
-    err = clGetPlatformIDs(10, platforms, &num_platforms);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "Error getting platform IDs: %s\n", get_cl_error_string(err));
-        return 1;
-    }
-    printf("Found %u OpenCL platform(s)\n\n", num_platforms);
-    
-    // Print platform information
-    for (cl_uint i = 0; i < num_platforms; i++) {
-        char platform_name[256];
-        char platform_vendor[256];
-        char platform_version[256];
-        
-        clGetPlatformInfo(platforms[i], CL_PLATFORM_NAME, sizeof(platform_name), platform_name, NULL);
-        clGetPlatformInfo(platforms[i], CL_PLATFORM_VENDOR, sizeof(platform_vendor), platform_vendor, NULL);
-        clGetPlatformInfo(platforms[i], CL_PLATFORM_VERSION, sizeof(platform_version), platform_version, NULL);
-        
-        printf("Platform %u:\n", i);
-        printf("  Name: %s\n", platform_name);
-        printf("  Vendor: %s\n", platform_vendor);
-        printf("  Version: %s\n", platform_version);
-        printf("\n");
-    }
-    
-    // Use first platform
-    cl_platform_id platform = platforms[0];
-    printf("Using platform 0\n\n");
-    
-    printf("=== OpenCL Device Detection ===\n");
-    cl_uint num_devices;
-    cl_device_id devices[10];
-    
-    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 10, devices, &num_devices);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr, "Error getting device IDs: %s\n", get_cl_error_string(err));
-        return 1;
-    }
-    printf("Found %u device(s)\n\n", num_devices);
-    
-    // Print all device information
-    for (cl_uint i = 0; i < num_devices; i++) {
-        print_device_info(devices[i], i);
-    }
-    
-    // Select device
-    if (device_id >= num_devices) {
-        fprintf(stderr, "Error: Device ID %lu not found. Available devices: 0-%u\n", device_id, num_devices - 1);
-        return 1;
-    }
-    
-    cl_device_id device = devices[device_id];
-    printf("Selected device %lu\n\n", device_id);
+ 
+    printf("Selected device %lu\n\n", device_arg);
     // Add this after device selection:
     size_t max_work_group_size;
     clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_work_group_size), &max_work_group_size, NULL);
@@ -473,7 +364,6 @@ int main(int argc, char **argv) {
     printf("Work size: %zu\n", work_size);
     printf("Total iterations: %lu\n", total_iterations);
     printf("Batch size: %llu\n", (unsigned long long)BATCH_SIZE);
-    printf("Hash batch size: %d\n\n", HASH_BATCH_SIZE);
 
     auto main_start_time = std::chrono::high_resolution_clock::now();
     auto last_update_time = main_start_time;
@@ -483,84 +373,95 @@ int main(int argc, char **argv) {
 
     cl_uint compute_units;
     clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
-    size_t local_work_size = calculate_optimal_local_work_size(device);
-    size_t work_chunk_size = local_work_size * (compute_units * 4); // Scale chunk size too
 
-    printf("Using local_work_size: %zu, work_chunk_size: %zu\n", local_work_size, work_chunk_size);
-    printf("Will launch %zu kernel chunks per iteration\n", (BATCH_SIZE + work_chunk_size - 1) / work_chunk_size);
     int checkpointTemp = 0;
-    // Modified main processing loop
-    for (uint64_t curr_seed = start_seed; curr_seed <= end_seed; curr_seed += BATCH_SIZE) {
+    uint64_t global_work_size = BATCH_SIZE;
+
+
+    for (uint64_t curr_seed = start_seed; curr_seed <= end_seed; curr_seed += global_work_size) {
         // Reset results count once per batch
         int results_count = 0;
         err = clEnqueueWriteBuffer(queue, results_count_buf, CL_TRUE, 0, sizeof(int), &results_count, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "Error writing results count buffer: %s\n", get_cl_error_string(err));
-            break;
-        }
-        
-        // Launch multiple kernel chunks to cover the full BATCH_SIZE
-        for (uint64_t chunk_start = 0; chunk_start < BATCH_SIZE; chunk_start += work_chunk_size) {
-            uint64_t chunk_seed = curr_seed + chunk_start;
-            size_t this_chunk_size = (chunk_start + work_chunk_size <= BATCH_SIZE) ? 
-                                    work_chunk_size : (BATCH_SIZE - chunk_start);
-            
-            // Round up to multiple of local_work_size
-            size_t padded_chunk_size = ((this_chunk_size + local_work_size - 1) / local_work_size) * local_work_size;
-            
-            // Set kernel arguments for this chunk
-            err = clSetKernelArg(kernel, 0, sizeof(uint64_t), &chunk_seed);
+        if(curr_seed == end_seed){
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "Error writing results count buffer: %s\n", get_cl_error_string(err));
+                break;
+            }
+            err = clSetKernelArg(kernel, 0, sizeof(uint64_t), &curr_seed);
             if (err != CL_SUCCESS) {
                 fprintf(stderr, "Error setting kernel arg 0 (seed): %s\n", get_cl_error_string(err));
                 break;
             }
-            
+
             err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_results);
             if (err != CL_SUCCESS) {
                 fprintf(stderr, "Error setting kernel arg 1 (results): %s\n", get_cl_error_string(err));
                 break;
             }
-            
+
             err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &results_count_buf);
             if (err != CL_SUCCESS) {
                 fprintf(stderr, "Error setting kernel arg 2 (results_count): %s\n", get_cl_error_string(err));
                 break;
             }
-            
+
             err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &checksum_buf);
             if (err != CL_SUCCESS) {
                 fprintf(stderr, "Error setting kernel arg 3 (checksum): %s\n", get_cl_error_string(err));
                 break;
             }
-            
-            // Launch kernel chunk with proper work group size
-            err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &padded_chunk_size, &local_work_size, 0, NULL, NULL);
+            err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
             if (err != CL_SUCCESS) {
-                fprintf(stderr, "Error launching kernel chunk at seed %llu, chunk %llu: %s\n", 
-                        curr_seed, chunk_start, get_cl_error_string(err));
-                
-                // Additional debugging info for common errors
-                if (err == CL_INVALID_WORK_GROUP_SIZE) {
-                    fprintf(stderr, "Chunk size: %zu, Padded: %zu, Local: %zu, Max work group: %zu\n", 
-                            this_chunk_size, padded_chunk_size, local_work_size, max_work_group_size);
-                }
+                fprintf(stderr, "Error launching kernel at seed %llu, %s\n", 
+                        curr_seed, get_cl_error_string(err));
                 break;
             }
+            err = clFinish(queue);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr, "Error waiting for kernel completion: %s\n", get_cl_error_string(err));
+                break;
+            }
+            
+            curr_seed += global_work_size;
         }
-        
-        // Check if we broke out of the inner loop due to error
         if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error writing results count buffer: %s\n", get_cl_error_string(err));
             break;
         }
-        
-        // Wait for all kernel chunks to complete
+        err = clSetKernelArg(kernel, 0, sizeof(uint64_t), &curr_seed);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error setting kernel arg 0 (seed): %s\n", get_cl_error_string(err));
+            break;
+        }
+
+        err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_results);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error setting kernel arg 1 (results): %s\n", get_cl_error_string(err));
+            break;
+        }
+
+        err = clSetKernelArg(kernel, 2, sizeof(cl_mem), &results_count_buf);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error setting kernel arg 2 (results_count): %s\n", get_cl_error_string(err));
+            break;
+        }
+
+        err = clSetKernelArg(kernel, 3, sizeof(cl_mem), &checksum_buf);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error setting kernel arg 3 (checksum): %s\n", get_cl_error_string(err));
+            break;
+        }
+        err = clEnqueueNDRangeKernel(queue, kernel, 1, NULL, &global_work_size, NULL, 0, NULL, NULL);
+        if (err != CL_SUCCESS) {
+            fprintf(stderr, "Error launching kernel at seed %llu, %s\n", 
+                    curr_seed, get_cl_error_string(err));
+            break;
+        }
         err = clFinish(queue);
         if (err != CL_SUCCESS) {
             fprintf(stderr, "Error waiting for kernel completion: %s\n", get_cl_error_string(err));
             break;
         }
-        
-        // Read back results (same as before)
         err = clEnqueueReadBuffer(queue, results_count_buf, CL_TRUE, 0, sizeof(int), &results_count, 0, NULL, NULL);
         if (err != CL_SUCCESS) {
             fprintf(stderr, "Error reading results count: %s\n", get_cl_error_string(err));
