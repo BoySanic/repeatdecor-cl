@@ -375,7 +375,7 @@ int main(int argc, char **argv) {
     clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
 
     int checkpointTemp = 0;
-    uint64_t global_work_size = BATCH_SIZE;
+    size_t global_work_size = BATCH_SIZE;
 
 
     for (uint64_t curr_seed = start_seed; curr_seed <= end_seed; curr_seed += global_work_size) {

@@ -5,7 +5,7 @@ const int RUNS_PER_CHECKPOINT = 16;
 // Constants
 __constant ulong XL = 0x9E3779B97F4A7C15UL;
 __constant ulong XH = 0x6A09E667F3BCC909UL;
-__constant ulong XL_BASE = XL * 4; // HASH_BATCH_SIZE = 4
+__constant ulong XL_BASE = 0x278DDE6E5FD29F054UL; // HASH_BATCH_SIZE = 4
 __constant int HASH_BATCH_SIZE = 4;
 __constant int SCORE_CUTOFF = 50;
 
