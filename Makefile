@@ -5,7 +5,7 @@ CXXFLAGS = -std=c++11 -O3 -Wall
 # Cross-compilation settings
 MINGW_PREFIX = x86_64-w64-mingw32
 CROSS_CXX = $(MINGW_PREFIX)-g++
-CROSS_CXXFLAGS = -std=c++11 -O3 -Wall -static-libgcc -static-libstdc++ 
+CROSS_CXXFLAGS = -std=c++11 -static -O3 -Wall -static-libgcc -static-libstdc++ 
 
 # Paths for Windows dependencies
 WIN_LIBS_DIR = ./lib/opencl/win
