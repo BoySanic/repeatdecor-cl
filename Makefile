@@ -5,7 +5,7 @@ CXXFLAGS = -std=c++11 -O3 -Wall
 # Cross-compilation settings
 MINGW_PREFIX = x86_64-w64-mingw32
 CROSS_CXX = $(MINGW_PREFIX)-g++
-CROSS_CXXFLAGS = -std=c++11 -static -O3 -Wall -static-libgcc -static-libstdc++ 
+CROSS_CXXFLAGS = -std=c++11 -O3 -Wall -static-libgcc -static-libstdc++ 
 
 # Paths for Windows dependencies
 WIN_LIBS_DIR = ./lib/opencl/win
@@ -56,7 +56,7 @@ $(WIN_TARGET): $(SOURCES)
 	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -o $(WIN_TARGET) $(SOURCES) $(WIN_OPENCL_LIBS)
 
 $(WIN_BOINC_TARGET): $(SOURCES)
-	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -I$(BOINC_INCLUDE_WIN) -L$(BOINC_WIN) -o $(WIN_BOINC_TARGET) $(SOURCES) -D_WIN32 -DBOINC -lboinc_api -lboinc_opencl -lboinc -luser32 -lpthread $(WIN_OPENCL_LIBS)
+	$(CROSS_CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -I$(BOINC_INCLUDE_WIN) -L$(BOINC_WIN) -o $(WIN_BOINC_TARGET) $(SOURCES) -D_WIN32 -DBOINC -lboinc_api -lboinc -luser32 -lpthread -lboinc_opencl $(WIN_OPENCL_LIBS)
 
 $(LIN_BOINC_TARGET): $(SOURCES)
 	$(CXX) $(CROSS_CXXFLAGS) -I$(INCLUDE_DIR) -L$(BOINC_LIN) -o $(LIN_BOINC_TARGET) $(SOURCES) -DBOINC -lboinc_api -lboinc -lpthread -lboinc_opencl $(OPENCL_LIBS) 
